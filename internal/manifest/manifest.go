@@ -19,6 +19,8 @@ import (
 	"hash/crc32"
 	"os"
 	"sort"
+	"sync"
+	"sync/atomic"
 
 	"github.com/talaria0101/moraine/internal/key"
 )
@@ -27,9 +29,10 @@ var castagnoli = crc32.MakeTable(crc32.Castagnoli)
 
 // Record tags.
 const (
-	recAdd    = 1
-	recDelete = 2
-	recNextID = 3
+	recAdd     = 1
+	recDelete  = 2
+	recNextID  = 3
+	recNextSeq = 4
 )
 
 // DefaultSnapshotBytes is the manifest log size at which LogAndApply
@@ -53,6 +56,7 @@ type Edit struct {
 	Added   []TableMeta
 	Deleted []uint64 // table IDs
 	NextID  uint64   // persisted so file numbers never regress after a snapshot; 0 leaves it alone
+	NextSeq uint64   // persisted sequence watermark so recovered WAL entries never reuse a sequence already in a table; 0 leaves it alone
 }
 
 // Version is an immutable set of live tables, one slice per level.
@@ -123,9 +127,9 @@ func apply(cur *Version, e *Edit) *Version {
 	return next
 }
 
-// findLevelFile binary searches a level >= 1 for the file whose range
+// FindFile binary searches a level >= 1 for the file whose range
 // covers userKey.
-func (v *Version) findLevelFile(level int, userKey []byte) (TableMeta, bool) {
+func (v *Version) FindFile(level int, userKey []byte) (TableMeta, bool) {
 	if level >= len(v.Levels) {
 		return TableMeta{}, false
 	}
@@ -197,8 +201,10 @@ type Manifest struct {
 	path      string
 	f         *os.File
 	w         *bufio.Writer
-	cur       *Version
+	mu        sync.Mutex
+	cur       atomic.Pointer[Version]
 	nextID    uint64
+	nextSeq   uint64
 	logBytes  int64
 	snapBytes int64
 }
@@ -209,7 +215,6 @@ type Manifest struct {
 func Open(path string) (*Manifest, error) {
 	m := &Manifest{
 		path:      path,
-		cur:       NewVersion(),
 		snapBytes: DefaultSnapshotBytes,
 	}
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o644)
@@ -217,12 +222,15 @@ func Open(path string) (*Manifest, error) {
 		return nil, err
 	}
 	m.f = f
-	good, nextID, err := replay(f, m.cur)
+	cur := NewVersion()
+	good, nextID, nextSeq, err := replay(f, cur)
 	if err != nil {
 		f.Close()
 		return nil, err
 	}
+	m.cur.Store(cur)
 	m.nextID = nextID
+	m.nextSeq = nextSeq
 	if fi, err := f.Stat(); err == nil {
 		m.logBytes = fi.Size()
 	} else {
@@ -246,12 +254,13 @@ func Open(path string) (*Manifest, error) {
 }
 
 // replay walks the log, applying every complete record to v. It
-// returns the offset after the last good record and the next file ID
-// to hand out.
-func replay(f *os.File, v *Version) (int64, uint64, error) {
+// returns the offset after the last good record, the next file ID, and
+// the persisted sequence watermark.
+func replay(f *os.File, v *Version) (int64, uint64, uint64, error) {
 	var hdr [8]byte
 	var off int64
 	next := uint64(1)
+	nextSeq := uint64(0)
 	bump := func(id uint64) {
 		if id >= next {
 			next = id + 1
@@ -261,41 +270,52 @@ func replay(f *os.File, v *Version) (int64, uint64, error) {
 		if _, err := f.ReadAt(hdr[:], off); err != nil {
 			// EOF at any point of the header is a clean or torn
 			// end; either way the good prefix ends at off.
-			return off, next, nil
+			return off, next, nextSeq, nil
 		}
 		n := binary.LittleEndian.Uint32(hdr[0:4])
 		want := binary.LittleEndian.Uint32(hdr[4:8])
 		if n > 1<<24 {
-			return off, next, nil
+			return off, next, nextSeq, nil
 		}
 		payload := make([]byte, n)
 		if _, err := f.ReadAt(payload, off+8); err != nil {
-			return off, next, nil
+			return off, next, nextSeq, nil
 		}
 		if crc32.Checksum(payload, castagnoli) != want {
-			return off, next, nil
+			return off, next, nextSeq, nil
 		}
-		taggedID, isNext, err := decodeRecord(payload, v)
+		val, kind, err := decodeRecord(payload, v)
 		if err != nil {
-			return off, next, nil
+			return off, next, nextSeq, nil
 		}
-		if isNext {
-			if taggedID > next {
-				next = taggedID
+		switch kind {
+		case markNextID:
+			if val > next {
+				next = val
 			}
-		} else {
-			bump(taggedID)
+		case markNextSeq:
+			if val > nextSeq {
+				nextSeq = val
+			}
+		default:
+			bump(val)
 		}
 		off += 8 + int64(n)
 	}
 }
 
-// decodeRecord applies one record and returns the file ID it
-// mentioned; isNext reports whether that ID was a persisted
-// next-file-id marker rather than a table.
-func decodeRecord(p []byte, v *Version) (uint64, bool, error) {
+// Where a decoded record's value goes.
+const (
+	markFileID = iota
+	markNextID
+	markNextSeq
+)
+
+// decodeRecord applies one record and reports the value it carried and
+// which counter it belongs to.
+func decodeRecord(p []byte, v *Version) (uint64, int, error) {
 	if len(p) == 0 {
-		return 0, false, errors.New("empty record")
+		return 0, markFileID, errors.New("empty record")
 	}
 	tag, p := p[0], p[1:]
 	switch tag {
@@ -303,44 +323,50 @@ func decodeRecord(p []byte, v *Version) (uint64, bool, error) {
 		m := TableMeta{}
 		var ok bool
 		if m.ID, p, ok = getUvarint(p); !ok {
-			return 0, false, errors.New("bad add record")
+			return 0, markFileID, errors.New("bad add record")
 		}
 		var lvl uint64
 		if lvl, p, ok = getUvarint(p); !ok {
-			return 0, false, errors.New("bad add record")
+			return 0, markFileID, errors.New("bad add record")
 		}
 		m.Level = int(lvl)
 		if m.Size, p, ok = getUvarint(p); !ok {
-			return 0, false, errors.New("bad add record")
+			return 0, markFileID, errors.New("bad add record")
 		}
 		if m.Count, p, ok = getUvarint(p); !ok {
-			return 0, false, errors.New("bad add record")
+			return 0, markFileID, errors.New("bad add record")
 		}
 		if m.Smallest, p, ok = getBytes(p); !ok {
-			return 0, false, errors.New("bad add record")
+			return 0, markFileID, errors.New("bad add record")
 		}
 		if m.Largest, p, ok = getBytes(p); !ok {
-			return 0, false, errors.New("bad add record")
+			return 0, markFileID, errors.New("bad add record")
 		}
 		v.ensureLevels(m.Level)
 		v.Levels[m.Level] = append(v.Levels[m.Level], m)
-		return m.ID, false, nil
+		return m.ID, markFileID, nil
 	case recDelete:
 		id, _, ok := getUvarint(p)
 		if !ok {
-			return 0, false, errors.New("bad delete record")
+			return 0, markFileID, errors.New("bad delete record")
 		}
 		del := &Edit{Deleted: []uint64{id}}
 		*v = *apply(v, del)
-		return id, false, nil
+		return id, markFileID, nil
 	case recNextID:
 		id, _, ok := getUvarint(p)
 		if !ok {
-			return 0, false, errors.New("bad next-id record")
+			return 0, markNextID, errors.New("bad next-id record")
 		}
-		return id, true, nil
+		return id, markNextID, nil
+	case recNextSeq:
+		seq, _, ok := getUvarint(p)
+		if !ok {
+			return 0, markNextSeq, errors.New("bad next-seq record")
+		}
+		return seq, markNextSeq, nil
 	default:
-		return 0, false, errors.New("unknown record tag")
+		return 0, markFileID, errors.New("unknown record tag")
 	}
 }
 

@@ -138,23 +138,26 @@ func (t *Table) Len() int {
 	return t.len
 }
 
-// Iter walks the memtable in internal key order. Not safe for
-// concurrent use with writes.
+// Iter walks the memtable in internal key order. Each positioning
+// step takes the table's read lock, so iteration is safe while other
+// goroutines write: nodes are never removed or mutated after insert,
+// and a step either sees a fresh or a stale but always linked tower
+// pointer.
 type Iter struct {
 	t   *Table
 	cur *node
 }
 
-// NewIter returns an iterator positioned before the first entry. The
-// memtable must not receive writes while the iterator is used, which
-// the DB guarantees by freezing a table before anyone iterates it.
+// NewIter returns an iterator positioned before the first entry.
 func (t *Table) NewIter() *Iter {
 	return &Iter{t: t, cur: t.head}
 }
 
 // First positions on the first entry.
 func (it *Iter) First() bool {
+	it.t.mu.RLock()
 	it.cur = it.t.head.tower[0]
+	it.t.mu.RUnlock()
 	return it.cur != nil
 }
 
@@ -166,7 +169,9 @@ func (it *Iter) Next() bool {
 	if it.cur == nil {
 		return false
 	}
+	it.t.mu.RLock()
 	it.cur = it.cur.tower[0]
+	it.t.mu.RUnlock()
 	return it.cur != nil
 }
 
@@ -179,6 +184,7 @@ func (it *Iter) Current() (key.Internal, []byte) {
 
 // Seek positions on the first entry >= target.
 func (it *Iter) Seek(target []byte) bool {
+	it.t.mu.RLock()
 	cur := it.t.head
 	for level := maxHeight - 1; level >= 0; level-- {
 		for cur.tower[level] != nil && key.Compare(cur.tower[level].ikey, target) < 0 {
@@ -186,5 +192,16 @@ func (it *Iter) Seek(target []byte) bool {
 		}
 	}
 	it.cur = cur.tower[0]
+	it.t.mu.RUnlock()
 	return it.cur != nil
 }
+
+// CurrentRaw returns the raw internal key and value under the cursor.
+// Cheaper than Current when the caller wants byte compares anyway.
+func (it *Iter) CurrentRaw() ([]byte, []byte) {
+	return it.cur.ikey, it.cur.value
+}
+
+// Error returns nil; the skiplist cannot fail. Present for iterator
+// interface symmetry with the table iterators.
+func (it *Iter) Error() error { return nil }

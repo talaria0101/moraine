@@ -215,6 +215,13 @@ func (w *Writer) Finish() (Meta, error) {
 // Abort releases the writer without finishing the file.
 func (w *Writer) Abort() { w.fin = true }
 
+// Size returns the bytes written so far, including flushed blocks but
+// not the pending one or the footer.
+func (w *Writer) Size() int64 { return int64(w.pos) }
+
+// Count returns the entries added so far.
+func (w *Writer) Count() uint64 { return w.count }
+
 // ReaderAt is the read side of a table file. os.File satisfies it.
 type ReaderAt interface {
 	ReadAt(p []byte, off int64) (int, error)
@@ -302,6 +309,15 @@ func Open(r ReaderAt, size uint64) (*Reader, error) {
 		}
 	}
 	return rd, nil
+}
+
+// Close closes the underlying file when it supports closing. Cached
+// readers in db use it to release descriptors.
+func (r *Reader) Close() error {
+	if c, ok := r.r.(io.Closer); ok {
+		return c.Close()
+	}
+	return nil
 }
 
 func (r *Reader) readBlockRaw(h Handle) ([]byte, error) {
@@ -504,4 +520,10 @@ func (it *Iter) Seek(target []byte) bool {
 		idx++
 	}
 	return false
+}
+
+// CurrentRaw returns the raw internal key and value under the cursor.
+func (it *Iter) CurrentRaw() ([]byte, []byte) {
+	e := it.iter.Current()
+	return e.Key, e.Value
 }

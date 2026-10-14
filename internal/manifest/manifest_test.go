@@ -199,11 +199,11 @@ func TestVersionOverlaps(t *testing.T) {
 		t.Fatalf("empty range: got %v", got)
 	}
 	// Deeper levels must be binary-searchable by point.
-	if m, ok := v.findLevelFile(1, []byte("g")); !ok || m.ID != 3 {
-		t.Fatalf("findLevelFile(g): %v %v", m, ok)
+	if m, ok := v.FindFile(1, []byte("g")); !ok || m.ID != 3 {
+		t.Fatalf("FindFile(g): %v %v", m, ok)
 	}
-	if _, ok := v.findLevelFile(1, []byte("e")); ok {
-		t.Fatal("findLevelFile(e) should miss the gap between c and f")
+	if _, ok := v.FindFile(1, []byte("e")); ok {
+		t.Fatal("FindFile(e) should miss the gap between c and f")
 	}
 }
 
@@ -260,5 +260,36 @@ func TestManifestRandomizedReplay(t *testing.T) {
 		if !got[id] {
 			t.Fatalf("table %d missing after replay", id)
 		}
+	}
+}
+
+// TestManifestWatermarksThroughClone proves the cloneEdit path carries
+// both watermarks into LogAndApply. Dropping NextSeq there used to
+// reset the recovery sequence on every reopen, making every flushed
+// entry invisible to new readers.
+func TestManifestWatermarksThroughClone(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "MANIFEST")
+	m := mustOpen(t, path)
+	mustApply(t, m, &Edit{
+		Added:   []TableMeta{meta(1, 0, "a", "m")},
+		NextID:  50,
+		NextSeq: 1000,
+	})
+	if got := m.NextFileID(); got != 50 {
+		t.Fatalf("NextFileID in-process: got %d, want 50", got)
+	}
+	if got := m.RecoveredNextSeq(); got != 1000 {
+		t.Fatalf("RecoveredNextSeq in-process: got %d, want 1000", got)
+	}
+	if err := m.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	m2 := mustOpen(t, path)
+	defer m2.Close()
+	if got := m2.NextFileID(); got != 50 {
+		t.Fatalf("NextFileID after reopen: got %d, want 50", got)
+	}
+	if got := m2.RecoveredNextSeq(); got != 1000 {
+		t.Fatalf("RecoveredNextSeq after reopen: got %d, want 1000", got)
 	}
 }

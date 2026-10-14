@@ -11,15 +11,32 @@ import (
 
 // Current returns the current version. The returned pointer is
 // immutable and safe for concurrent readers.
-func (m *Manifest) Current() *Version { return m.cur }
+func (m *Manifest) Current() *Version { return m.cur.Load() }
 
 // NextFileID returns the next unused file ID without consuming it.
-func (m *Manifest) NextFileID() uint64 { return m.nextID }
+func (m *Manifest) NextFileID() uint64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.nextID
+}
+
+// RecoveredNextSeq returns the sequence watermark from the log, or 0
+// when none was recorded. The DB seeds its sequence counter from it so
+// replayed WAL entries never reuse a sequence that is already inside a
+// table.
+func (m *Manifest) RecoveredNextSeq() uint64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.nextSeq
+}
 
 // LogAndApply appends the edit to the log, fsyncs, then publishes the
 // new version. The edit's Added tables must already be fsynced on
-// disk; this call is what makes them live.
+// disk; this call is what makes them live. Calls serialize on the
+// manifest mutex; the log and the watermarks have no other guard.
 func (m *Manifest) LogAndApply(e *Edit) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	e = cloneEdit(e)
 	// Defensive: file IDs handed out must never be reused even if the
 	// caller forgot to carry NextID forward.
@@ -30,6 +47,9 @@ func (m *Manifest) LogAndApply(e *Edit) error {
 	}
 	if e.NextID != 0 && e.NextID > m.nextID {
 		m.nextID = e.NextID
+	}
+	if e.NextSeq > m.nextSeq {
+		m.nextSeq = e.NextSeq
 	}
 	var buf []byte
 	for _, meta := range e.Added {
@@ -43,6 +63,9 @@ func (m *Manifest) LogAndApply(e *Edit) error {
 	var nb []byte
 	nb = binary.AppendUvarint(nb, m.nextID)
 	buf = appendRecord(buf, recNextID, nb)
+	var sb []byte
+	sb = binary.AppendUvarint(sb, m.nextSeq)
+	buf = appendRecord(buf, recNextSeq, sb)
 	n, err := m.w.Write(buf)
 	if err != nil {
 		return err
@@ -57,9 +80,9 @@ func (m *Manifest) LogAndApply(e *Edit) error {
 	if err := syncDir(filepath.Dir(m.path)); err != nil {
 		return err
 	}
-	m.cur = apply(m.cur, e)
+	m.cur.Store(apply(m.cur.Load(), e))
 	if m.logBytes >= m.snapBytes {
-		return m.RewriteSnapshot()
+		return m.rewriteSnapshotLocked()
 	}
 	return nil
 }
@@ -68,6 +91,14 @@ func (m *Manifest) LogAndApply(e *Edit) error {
 // current version. File IDs are re-recorded so nextID never regresses
 // even when every table that used a high ID has since been dropped.
 func (m *Manifest) RewriteSnapshot() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.rewriteSnapshotLocked()
+}
+
+// rewriteSnapshotLocked is RewriteSnapshot with the manifest mutex
+// already held.
+func (m *Manifest) rewriteSnapshotLocked() error {
 	tmp := m.path + ".tmp"
 	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
 	if err != nil {
@@ -75,7 +106,7 @@ func (m *Manifest) RewriteSnapshot() error {
 	}
 	w := bufio.NewWriter(f)
 	var buf []byte
-	for _, lv := range m.cur.Levels {
+	for _, lv := range m.cur.Load().Levels {
 		for _, meta := range lv {
 			buf = appendRecord(buf, recAdd, encodeAdd(meta))
 		}
@@ -83,6 +114,9 @@ func (m *Manifest) RewriteSnapshot() error {
 	var nb []byte
 	nb = binary.AppendUvarint(nb, m.nextID)
 	buf = appendRecord(buf, recNextID, nb)
+	var sb []byte
+	sb = binary.AppendUvarint(sb, m.nextSeq)
+	buf = appendRecord(buf, recNextSeq, sb)
 	if _, err := w.Write(buf); err != nil {
 		f.Close()
 		os.Remove(tmp)
@@ -127,8 +161,11 @@ func (m *Manifest) RewriteSnapshot() error {
 	return nil
 }
 
-// Close flushes and closes the log.
+// Close flushes and closes the log. The caller must have stopped all
+// background edits first.
 func (m *Manifest) Close() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if err := m.w.Flush(); err != nil {
 		m.f.Close()
 		return err
@@ -138,9 +175,10 @@ func (m *Manifest) Close() error {
 
 func cloneEdit(e *Edit) *Edit {
 	out := &Edit{
-		Added:   append([]TableMeta(nil), e.Added...),
-		Deleted: append([]uint64(nil), e.Deleted...),
-		NextID:  e.NextID,
+		Added:    append([]TableMeta(nil), e.Added...),
+		Deleted:  append([]uint64(nil), e.Deleted...),
+		NextID:   e.NextID,
+		NextSeq:  e.NextSeq,
 	}
 	for i := range out.Added {
 		out.Added[i].Smallest = append([]byte(nil), e.Added[i].Smallest...)
