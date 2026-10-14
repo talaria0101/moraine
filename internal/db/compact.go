@@ -38,7 +38,15 @@ func (db *DB) compactLoop() {
 		if db.closingFlag.Load() {
 			return
 		}
-		if err := db.runCompaction(c); err != nil {
+		db.mu.Lock()
+		db.compacting = true
+		db.mu.Unlock()
+		err := db.runCompaction(c)
+		db.mu.Lock()
+		db.compacting = false
+		db.cond.Broadcast()
+		db.mu.Unlock()
+		if err != nil {
 			db.setBgError(err)
 			return
 		}
@@ -46,35 +54,78 @@ func (db *DB) compactLoop() {
 	}
 }
 
-// pickCompaction chooses the next compaction or nil. L0 fires on file
-// count; deeper levels fire when they exceed their size target, one
-// file at a time, first key first. This is the default leveled
-// trigger; the policy experiments replace it.
+// pickCompaction computes each level's score under the active policy
+// and compacts the highest-scoring level at or above 1.0, shallowest
+// on ties so pressure drains in order. Every policy keeps levels
+// disjoint, so the reader's FindFile fast path stays valid under all
+// of them.
 func (db *DB) pickCompaction() *compaction {
-	v := db.man.Current()
-	if len(v.Levels) > 0 && len(v.Levels[0]) >= db.opts.L0CompactionTrigger {
-		c := &compaction{level: 0, target: 1}
-		c.inputs[0] = append(c.inputs[0], v.Levels[0]...)
-		c.inputs[1] = expandOverlaps(v, 1, c.inputs[0])
-		return c
-	}
-	for l := 1; l < db.opts.MaxLevels-1; l++ {
-		if l >= len(v.Levels) {
-			break
-		}
-		size := uint64(0)
-		for _, m := range v.Levels[l] {
-			size += m.Size
-		}
-		if size <= db.opts.levelTarget(l) || len(v.Levels[l]) == 0 {
+	return db.pickFrom(db.man.Current())
+}
+
+// pickFrom is pickCompaction over an explicit version; split out so
+// tests can drive the policy against a hand-built tree.
+func (db *DB) pickFrom(v *manifest.Version) *compaction {
+	best := -1
+	bestScore := 0.0
+	for l := 0; l < db.opts.MaxLevels-1; l++ {
+		if l >= len(v.Levels) || len(v.Levels[l]) == 0 {
 			continue
 		}
-		c := &compaction{level: l, target: l + 1}
-		c.inputs[0] = append(c.inputs[0], v.Levels[l][0])
-		c.inputs[1] = expandOverlaps(v, l+1, c.inputs[0])
-		return c
+		s := db.levelScore(v, l)
+		if s < 1.0 {
+			continue
+		}
+		if best < 0 || s > bestScore {
+			best, bestScore = l, s
+		}
 	}
-	return nil
+	if best < 0 {
+		return nil
+	}
+	c := &compaction{level: best, target: best + 1}
+	switch db.opts.Compaction {
+	case Tiered:
+		// Wholesale: everything from this level, everything from
+		// the next.
+		c.inputs[0] = append(c.inputs[0], v.Levels[best]...)
+		if best+1 < len(v.Levels) {
+			c.inputs[1] = append(c.inputs[1], v.Levels[best+1]...)
+		}
+	case LazyLeveled:
+		// Everything from this level, but only the overlapping
+		// part of the next.
+		c.inputs[0] = append(c.inputs[0], v.Levels[best]...)
+		c.inputs[1] = expandOverlaps(v, best+1, c.inputs[0])
+	default:
+		// Leveled: L0 must merge as a unit (its files overlap each
+		// other); deeper levels move one seed file at a time.
+		if best == 0 {
+			c.inputs[0] = append(c.inputs[0], v.Levels[0]...)
+		} else {
+			c.inputs[0] = append(c.inputs[0], v.Levels[best][0])
+		}
+		c.inputs[1] = expandOverlaps(v, best+1, c.inputs[0])
+	}
+	return c
+}
+
+// levelScore measures how far level l is over its policy's budget.
+func (db *DB) levelScore(v *manifest.Version, l int) float64 {
+	lv := v.Levels[l]
+	if db.opts.Compaction == Leveled {
+		if l == 0 {
+			return float64(len(lv)) / float64(db.opts.L0CompactionTrigger)
+		}
+		var size uint64
+		for _, m := range lv {
+			size += m.Size
+		}
+		return float64(size) / float64(db.opts.levelTarget(l))
+	}
+	// Tiered and lazy both fill a level to TieredFiles runs before
+	// merging it down.
+	return float64(len(lv)) / float64(db.opts.TieredFiles)
 }
 
 // expandOverlaps returns the files of level overlapping the range of
@@ -127,16 +178,20 @@ func userOf(ik []byte) []byte {
 func (db *DB) runCompaction(c *compaction) error {
 	var srcs []*mergeSrc
 	var inputIDs []uint64
+	var inputBytes uint64
 	for _, m := range c.inputs[0] {
+		inputBytes += m.Size
 		if err := appendTable(db, &srcs, &inputIDs, m); err != nil {
 			return err
 		}
 	}
 	for _, m := range c.inputs[1] {
+		inputBytes += m.Size
 		if err := appendTable(db, &srcs, &inputIDs, m); err != nil {
 			return err
 		}
 	}
+	db.stats.compBytes.Add(inputBytes)
 
 	var outputs []manifest.TableMeta
 	fail := func(err error) error {

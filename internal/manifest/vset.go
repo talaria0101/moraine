@@ -175,10 +175,10 @@ func (m *Manifest) Close() error {
 
 func cloneEdit(e *Edit) *Edit {
 	out := &Edit{
-		Added:    append([]TableMeta(nil), e.Added...),
-		Deleted:  append([]uint64(nil), e.Deleted...),
-		NextID:   e.NextID,
-		NextSeq:  e.NextSeq,
+		Added:   append([]TableMeta(nil), e.Added...),
+		Deleted: append([]uint64(nil), e.Deleted...),
+		NextID:  e.NextID,
+		NextSeq: e.NextSeq,
 	}
 	for i := range out.Added {
 		out.Added[i].Smallest = append([]byte(nil), e.Added[i].Smallest...)

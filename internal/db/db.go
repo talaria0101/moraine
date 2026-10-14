@@ -26,6 +26,14 @@ type Stats struct {
 	SSTBytesWritten uint64
 	Flushes         uint64
 	Compactions     uint64
+	// Gets counts point lookups; SourcesProbed counts memtable and
+	// table probes those lookups made. Read amplification per get
+	// is SourcesProbed/Gets.
+	Gets          uint64
+	SourcesProbed uint64
+	// CompactionBytes sums the input bytes of every completed
+	// compaction; the rewrite cost the policy chose to pay.
+	CompactionBytes uint64
 }
 
 type flushJob struct {
@@ -77,11 +85,18 @@ type DB struct {
 	flushedTo atomic.Uint64
 
 	stats struct {
-		walBytes    atomic.Uint64
-		sstWritten  atomic.Uint64
-		flushes     atomic.Uint64
-		compactions atomic.Uint64
+		walBytes      atomic.Uint64
+		sstWritten    atomic.Uint64
+		flushes       atomic.Uint64
+		compactions   atomic.Uint64
+		gets          atomic.Uint64
+		sourcesProbed atomic.Uint64
+		compBytes     atomic.Uint64
 	}
+
+	// compacting is true while compactLoop is inside runCompaction;
+	// guarded by mu and broadcast on cond when it clears.
+	compacting bool
 }
 
 type bgError struct{ err error }
@@ -255,7 +270,36 @@ func (db *DB) Stats() Stats {
 		SSTBytesWritten: db.stats.sstWritten.Load(),
 		Flushes:         db.stats.flushes.Load(),
 		Compactions:     db.stats.compactions.Load(),
+		Gets:            db.stats.gets.Load(),
+		SourcesProbed:   db.stats.sourcesProbed.Load(),
+		CompactionBytes: db.stats.compBytes.Load(),
 	}
+}
+
+// LevelSizes returns the on-disk byte total of each level, indexed
+// by level number (slice index 0 is L0). The length is the number of
+// levels currently in use.
+func (db *DB) LevelSizes() []uint64 {
+	v := db.man.Current()
+	out := make([]uint64, len(v.Levels))
+	for l, files := range v.Levels {
+		for _, m := range files {
+			out[l] += m.Size
+		}
+	}
+	return out
+}
+
+// WaitIdle blocks until the flush queue is drained and no compaction
+// is running. A compaction picked in the instant WaitIdle returns can
+// still start; callers that need a settled tree should confirm the
+// Stats counters stop moving across a short sleep.
+func (db *DB) WaitIdle() {
+	db.mu.Lock()
+	for (len(db.imm) > 0 || db.compacting) && !db.closing {
+		db.cond.Wait()
+	}
+	db.mu.Unlock()
 }
 
 // bgFailure returns the first background error, if any. Flush and
@@ -424,9 +468,9 @@ func (db *DB) writeTable(it *mem.Iter, id uint64) (table.Meta, error) {
 		return table.Meta{}, err
 	}
 	tw := table.NewWriter(f, table.Options{
-		BlockSize:   db.opts.BlockSize,
-		BitsPerKey:  db.opts.BitsPerKey,
-	}) 
+		BlockSize:  db.opts.BlockSize,
+		BitsPerKey: db.opts.BitsPerKey,
+	})
 	var m table.Meta
 	for it.First(); it.Valid(); it.Next() {
 		ik, val := it.CurrentRaw()
@@ -467,6 +511,7 @@ func (db *DB) GetAt(userKey []byte, snap uint64) ([]byte, bool, error) {
 	if err := db.bgFailure(); err != nil {
 		return nil, false, err
 	}
+	db.stats.gets.Add(1)
 	v := db.man.Current()
 	db.mu.Lock()
 	memT := db.mem
@@ -479,16 +524,19 @@ func (db *DB) GetAt(userKey []byte, snap uint64) ([]byte, bool, error) {
 	// entry for the user key wins: within L0 every entry of a newer
 	// file is newer than every entry of an older one, because
 	// memtable flushes carry disjoint, increasing sequence ranges.
+	db.stats.sourcesProbed.Add(1)
 	if ik, val, ok := memT.Get(userKey, snap); ok {
 		return decideGet(ik, val)
 	}
 	for i := len(imms) - 1; i >= 0; i-- {
+		db.stats.sourcesProbed.Add(1)
 		if ik, val, ok := imms[i].t.Get(userKey, snap); ok {
 			return decideGet(ik, val)
 		}
 	}
 	if len(v.Levels) > 0 {
 		for _, m := range v.Levels[0] {
+			db.stats.sourcesProbed.Add(1)
 			r, release, err := db.acquireReader(m.ID)
 			if err != nil {
 				return nil, false, err
@@ -508,6 +556,7 @@ func (db *DB) GetAt(userKey []byte, snap uint64) ([]byte, bool, error) {
 		if !ok {
 			continue
 		}
+		db.stats.sourcesProbed.Add(1)
 		r, release, err := db.acquireReader(m.ID)
 		if err != nil {
 			return nil, false, err

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/talaria0101/moraine/internal/key"
+	"github.com/talaria0101/moraine/internal/manifest"
 )
 
 func openTest(t *testing.T, opts Options) (*DB, string) {
@@ -104,8 +105,70 @@ func checkGet(t *testing.T, db *DB, k string, want modelVal, phase string) {
 	}
 }
 
-func TestDBModel(t *testing.T) {
-	db, _ := openTest(t, smallOpts())
+func TestDBModelLeveled(t *testing.T) { runModelTest(t, smallOpts()) }
+
+// TestPickCompactionShallowTie locks the picker's tie-break: at equal
+// score the shallowest level wins. The deepest-on-tie variant read as
+// a one-token bug (>= instead of >) and inverted the tiered/lazy WAF
+// ordering in the benchmark, so this behavior is load-bearing.
+func TestPickCompactionShallowTie(t *testing.T) {
+	d, _ := openTest(t, Options{TieredFiles: 4, MaxLevels: 5, Compaction: Tiered})
+	defer d.Close()
+
+	ik := func(user string) []byte { return key.Encode(nil, []byte(user), 1, key.TypeSet) }
+	meta := func(level int, user string, size uint64) manifest.TableMeta {
+		return manifest.TableMeta{ID: d.allocFileID(), Level: level, Size: size,
+			Smallest: ik(user + "a"), Largest: ik(user + "z")}
+	}
+
+	// L1 and L2 both at exactly TieredFiles files: scores equal, so
+	// the shallow level must be picked.
+	v := &manifest.Version{Levels: make([][]manifest.TableMeta, 3)}
+	for _, user := range []string{"a", "m", "x", "z"} {
+		v.Levels[1] = append(v.Levels[1], meta(1, user, 100))
+	}
+	for _, user := range []string{"b", "n", "y", "q"} {
+		v.Levels[2] = append(v.Levels[2], meta(2, user, 100))
+	}
+	c := d.pickFrom(v)
+	if c == nil || c.level != 1 {
+		t.Fatalf("tie at score 1.0: picked %+v, want level 1", c)
+	}
+
+	// A deeper level strictly over budget outranks a shallow one at
+	// exactly budget: highest score wins.
+	for i := 0; i < 4; i++ {
+		v.Levels[2] = append(v.Levels[2], meta(2, "w", 100))
+	}
+	c = d.pickFrom(v)
+	if c == nil || c.level != 2 {
+		t.Fatalf("L2 score 2.0 vs L1 score 1.0: picked %+v, want level 2", c)
+	}
+
+	// Nothing at or above 1.0: no compaction.
+	empty := &manifest.Version{Levels: make([][]manifest.TableMeta, 2)}
+	empty.Levels[1] = []manifest.TableMeta{meta(1, "a", 100)}
+	if c := d.pickFrom(empty); c != nil {
+		t.Fatalf("under-budget tree picked %+v, want nil", c)
+	}
+}
+
+func TestDBModelTiered(t *testing.T) {
+	o := smallOpts()
+	o.Compaction = Tiered
+	o.TieredFiles = 2
+	runModelTest(t, o)
+}
+
+func TestDBModelLazy(t *testing.T) {
+	o := smallOpts()
+	o.Compaction = LazyLeveled
+	o.TieredFiles = 2
+	runModelTest(t, o)
+}
+
+func runModelTest(t *testing.T, opts Options) {
+	db, _ := openTest(t, opts)
 	defer db.Close()
 	rng := rand.New(rand.NewSource(7))
 	model := map[string]modelVal{}

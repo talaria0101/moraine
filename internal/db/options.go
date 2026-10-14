@@ -20,7 +20,7 @@ type Options struct {
 	// this many bytes, never mid-user-key. Default 2 MiB.
 	TargetFileSize uint64
 	// L0CompactionTrigger fires an L0-to-L1 compaction once L0 holds
-	// this many files. Default 4.
+	// this many files under Leveled. Default 4.
 	L0CompactionTrigger int
 	// MaxLevels is the number of levels including L0. Default 7.
 	MaxLevels int
@@ -30,6 +30,40 @@ type Options struct {
 	L1TargetBytes uint64
 	// LevelMultiplier scales per-level size targets. Default 10.
 	LevelMultiplier uint64
+	// Compaction selects the policy. Zero means Leveled.
+	Compaction CompactionPolicy
+	// TieredFiles is the number of files a level may hold before a
+	// tiered or lazy-leveled merge fires. Default 4.
+	TieredFiles int
+}
+
+// CompactionPolicy names the compaction strategy.
+type CompactionPolicy int
+
+const (
+	// Leveled keeps levels disjoint: small frequent merges rewrite
+	// only the overlap at the next level. Lowest read and space
+	// amplification, highest write amplification.
+	Leveled CompactionPolicy = iota
+	// Tiered fills a level to TieredFiles files, then merges the
+	// whole level into the next level wholesale. Lowest write
+	// amplification, worst space and read amplification.
+	Tiered
+	// LazyLeveled fills a level like Tiered but merges it only into
+	// the overlapping part of the next level. Sits between the
+	// other two on every axis.
+	LazyLeveled
+)
+
+func (p CompactionPolicy) String() string {
+	switch p {
+	case Tiered:
+		return "tiered"
+	case LazyLeveled:
+		return "lazy"
+	default:
+		return "leveled"
+	}
 }
 
 func (o *Options) fill() {
@@ -56,6 +90,9 @@ func (o *Options) fill() {
 	}
 	if o.LevelMultiplier <= 1 {
 		o.LevelMultiplier = 10
+	}
+	if o.TieredFiles <= 0 {
+		o.TieredFiles = 4
 	}
 }
 
