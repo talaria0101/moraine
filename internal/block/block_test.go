@@ -65,18 +65,26 @@ func TestSeek(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// For every key: seek to a prefix of it (sorts before it), seek to
-	// it exactly, and seek to it extended with a zero byte (sorts
-	// between it and its successor).
+	// Valid internal-key targets around entry i: same user key, trailer
+	// value nudged so the target sorts strictly between neighbours.
+	mkTarget := func(k []byte, trailer []byte) []byte {
+		t := append([]byte(nil), k[:len(k)-8]...)
+		return append(t, trailer...)
+	}
 	for i := 0; i < len(ents); i++ {
 		key := ents[i][0]
+		tr := key[len(key)-8:]
+		before := append([]byte(nil), tr...)
+		before[7] = tr[7] - 1 // smaller trailer sorts before entry i
+		after := append([]byte(nil), tr...)
+		after[7] = tr[7] + 1 // sorts after entry i, before entry i+1
 		cases := []struct {
 			name   string
 			target []byte
 			want   []byte
 			hit    bool
 		}{
-			{"before", key[:len(key)-1], key, true},
+			{"before", mkTarget(key, before), key, true},
 			{"exact", append([]byte(nil), key...), key, true},
 		}
 		if i+1 < len(ents) {
@@ -85,14 +93,14 @@ func TestSeek(t *testing.T) {
 				target []byte
 				want   []byte
 				hit    bool
-			}{"after", append(append([]byte(nil), key...), 0x00), ents[i+1][0], true})
+			}{"after", mkTarget(key, after), ents[i+1][0], true})
 		} else {
 			cases = append(cases, struct {
 				name   string
 				target []byte
 				want   []byte
 				hit    bool
-			}{"after", append(append([]byte(nil), key...), 0x00), nil, false})
+			}{"after", mkTarget(key, after), nil, false})
 		}
 		for _, c := range cases {
 			ok := it.Seek(c.target)
@@ -118,9 +126,10 @@ func TestSeekMiss(t *testing.T) {
 	if it.Seek(bytes.Repeat([]byte{0xff}, 40)) {
 		t.Fatal("seek past end should miss")
 	}
-	// "aaa" is smaller than the first key, so Seek must land on the
-	// first entry.
-	if !it.Seek([]byte("aaaa")) {
+	// A valid internal key whose user part sorts before every stored
+	// user key must land on the first entry.
+	small := append([]byte("aaaa"), 0, 0, 0, 0, 0, 0, 0, 1)
+	if !it.Seek(small) {
 		t.Fatal("seek before first should land on first entry")
 	}
 	if !bytes.Equal(it.Current().Key, ents[0][0]) {

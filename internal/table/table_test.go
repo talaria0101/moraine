@@ -219,23 +219,44 @@ func TestTableSeek(t *testing.T) {
 	path, _ := buildTable(t, es, Options{BlockSize: 512})
 	r := openTable(t, path)
 	it := r.NewIter()
-	for i := range es {
-		// exact
-		if !it.Seek(es[i].ikey()) {
-			t.Fatalf("seek miss at %d", i)
+	rng := rand.New(rand.NewSource(99))
+	cmpIkeys := func(i int, target []byte) bool {
+		return key.Compare(es[i].ikey(), target) >= 0
+	}
+	for probe := 0; probe < 2000; probe++ {
+		var target []byte
+		switch rng.Intn(3) {
+		case 0: // exact entry
+			target = es[rng.Intn(len(es))].ikey()
+		case 1: // same user, phantom sequence
+			e := es[rng.Intn(len(es))]
+			target = key.Encode(nil, e.k, e.s+rng.Uint64()%(1<<20), key.TypeSet)
+		case 2: // phantom user
+			target = key.Encode(nil, []byte(fmt.Sprintf("ghost%06d", rng.Intn(len(es)))), rng.Uint64()%(1<<30), key.TypeSet)
 		}
-		ik, _ := it.Current()
-		if !bytes.Equal(ik.UserKey, es[i].k) || ik.Seq != es[i].s {
-			t.Fatalf("seek %d landed wrong", i)
+		want := -1
+		lo, hi := 0, len(es)
+		for lo < hi {
+			mid := int(uint(lo+hi) / 2)
+			if cmpIkeys(mid, target) {
+				hi = mid
+			} else {
+				lo = mid + 1
+			}
 		}
-		// prefix sorts before
-		ikFull := es[i].ikey()
-		if !it.Seek(ikFull[:len(ikFull)-1]) {
-			t.Fatalf("prefix seek miss at %d", i)
+		if lo < len(es) {
+			want = lo
 		}
-		ik2, _ := it.Current()
-		if !bytes.Equal(ik2.UserKey, es[i].k) || ik2.Seq != es[i].s {
-			t.Fatalf("prefix seek %d landed wrong", i)
+		ok := it.Seek(target)
+		if (want >= 0) != ok {
+			t.Fatalf("probe %d: seek=%v want idx %d", probe, ok, want)
+		}
+		if ok {
+			ik, _ := it.Current()
+			got := key.Encode(nil, ik.UserKey, ik.Seq, ik.Type)
+			if key.Compare(es[want].ikey(), got) != 0 {
+				t.Fatalf("probe %d: landed wrong", probe)
+			}
 		}
 	}
 }

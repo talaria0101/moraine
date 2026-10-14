@@ -93,12 +93,15 @@ func CompareUser(a, b []byte) int {
 	return 0
 }
 
-// Compare orders internal keys: user key ascending, then sequence
-// number descending (newest first), then type ascending. Because the
-// trailer stores MaxSeq - seq big endian, this is exactly the raw byte
-// order of the encoded keys, so table and block code can use
-// bytes.Compare. It is kept as a named function to document intent and
-// as the one place to change if the encoding ever does.
+// Compare orders internal keys: user key ascending, then stored
+// trailer ascending. The stored trailer is (MaxSeq - seq) << 8 | type,
+// so trailer ascending means newer sequences first. This is NOT raw
+// byte order: with the inverted trailer, a user key that is a prefix of
+// another would interleave wrongly if compared bytewise, so every
+// ordered structure must compare through this function.
 func Compare(a, b []byte) int {
-	return bytes.Compare(a, b)
+	if c := CompareUser(a[:len(a)-TrailerLen], b[:len(b)-TrailerLen]); c != 0 {
+		return c
+	}
+	return bytes.Compare(a[len(a)-TrailerLen:], b[len(b)-TrailerLen:])
 }

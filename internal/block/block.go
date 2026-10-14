@@ -16,11 +16,12 @@
 package block
 
 import (
-	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"hash/crc32"
+
+	"github.com/talaria0101/moraine/internal/key"
 )
 
 // RestartInterval is the number of entries between restart points. It
@@ -57,14 +58,14 @@ func (b *Builder) Len() int { return len(b.buf) }
 // Add appends one entry. Keys must arrive in strictly increasing order
 // across the life of the builder; Add panics otherwise, because an
 // out-of-order table would silently lose entries.
-func (b *Builder) Add(key, value []byte) {
-	if b.sinceRestart > 0 && bytes.Compare(key, b.prevKey) <= 0 {
-		panic(fmt.Sprintf("block: out of order key %q after %q", key, b.prevKey))
+func (b *Builder) Add(ikey, value []byte) {
+	if b.sinceRestart > 0 && key.Compare(ikey, b.prevKey) <= 0 {
+		panic(fmt.Sprintf("block: out of order key %q after %q", ikey, b.prevKey))
 	}
 	shared := 0
 	if b.sinceRestart > 0 {
-		n := min(len(key), len(b.prevKey))
-		for shared < n && key[shared] == b.prevKey[shared] {
+		n := min(len(ikey), len(b.prevKey))
+		for shared < n && ikey[shared] == b.prevKey[shared] {
 			shared++
 		}
 	}
@@ -73,13 +74,13 @@ func (b *Builder) Add(key, value []byte) {
 		b.restarts = append(b.restarts, start)
 	}
 	b.buf = binary.AppendUvarint(b.buf, uint64(shared))
-	unshared := key[shared:]
+	unshared := ikey[shared:]
 	b.buf = binary.AppendUvarint(b.buf, uint64(len(unshared)))
 	b.buf = append(b.buf, unshared...)
 	b.buf = binary.AppendUvarint(b.buf, uint64(len(value)))
 	b.buf = append(b.buf, value...)
 
-	b.prevKey = append(b.prevKey[:0], key...)
+	b.prevKey = append(b.prevKey[:0], ikey...)
 	b.sinceRestart++
 	if b.sinceRestart >= RestartInterval {
 		b.sinceRestart = 0
@@ -267,7 +268,7 @@ func (it *Iter) Seek(target []byte) bool {
 	lo, hi := 0, len(it.restarts)-1
 	for lo < hi {
 		mid := int(uint(lo+hi+1) / 2)
-		if bytes.Compare(it.restartKey(mid), target) <= 0 {
+		if key.Compare(it.restartKey(mid), target) <= 0 {
 			lo = mid
 		} else {
 			hi = mid - 1
@@ -281,7 +282,7 @@ func (it *Iter) Seek(target []byte) bool {
 			it.pos = len(it.data)
 			return false
 		}
-		if bytes.Compare(e.Key, target) >= 0 {
+		if key.Compare(e.Key, target) >= 0 {
 			it.cur = e
 			it.pos = next
 			it.valid = true
